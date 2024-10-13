@@ -12,7 +12,7 @@ import {
   Select,
   FormControl,
   InputLabel,
-  useTheme
+  useTheme,
 } from "@mui/material";
 
 export default function Home() {
@@ -21,28 +21,31 @@ export default function Home() {
   const [transcript, setTranscript] = useState("");
   const [status, setStatus] = useState('Click "Start Listening" to begin.');
   const [loading, setLoading] = useState(false);
-  const [sensitivity, setSensitivity] = useState(
-    parseFloat(localStorage.getItem("sensitivity")) || 0.5
-  );
-  const [selectedVoice, setSelectedVoice] = useState(
-    localStorage.getItem("selectedVoice") || ""
-  );
+  const [sensitivity, setSensitivity] = useState(0.5); // Default value
+  const [selectedVoice, setSelectedVoice] = useState("");
   const [voices, setVoices] = useState([]);
-  const [pitch, setPitch] = useState(
-    parseFloat(localStorage.getItem("pitch")) || 1
-  );
-  const [rate, setRate] = useState(
-    parseFloat(localStorage.getItem("rate")) || 1
-  );
-  const [startDelay, setStartDelay] = useState(
-    parseFloat(localStorage.getItem("startDelay")) || 0
-  );
+  const [pitch, setPitch] = useState(1); // Default pitch value
+  const [rate, setRate] = useState(1); // Default rate value
+  const [startDelay, setStartDelay] = useState(0); // Default start delay value
 
   const wordBufferRef = useRef([]);
   const wakeLockRef = useRef(null);
-  const theme = useTheme();
+  const theme = useTheme(); // Import theme to use for dark/light mode detection
 
   useEffect(() => {
+    if (typeof window !== "undefined") {
+      const savedSensitivity = localStorage.getItem("sensitivity");
+      const savedVoice = localStorage.getItem("selectedVoice");
+      const savedPitch = localStorage.getItem("pitch");
+      const savedRate = localStorage.getItem("rate");
+      const savedStartDelay = localStorage.getItem("startDelay");
+
+      if (savedSensitivity) setSensitivity(parseFloat(savedSensitivity));
+      if (savedVoice) setSelectedVoice(savedVoice);
+      if (savedPitch) setPitch(parseFloat(savedPitch));
+      if (savedRate) setRate(parseFloat(savedRate));
+      if (savedStartDelay) setStartDelay(parseFloat(savedStartDelay));
+    }
     const loadVoices = () => {
       const voicesList = window.speechSynthesis.getVoices();
       setVoices(voicesList);
@@ -123,27 +126,37 @@ export default function Home() {
 
   const handleSensitivityChange = (event, newValue) => {
     setSensitivity(newValue);
-    localStorage.setItem("sensitivity", newValue);
+    if (typeof window !== "undefined") {
+      localStorage.setItem("sensitivity", newValue);
+    }
   };
 
   const handleVoiceChange = (event) => {
     setSelectedVoice(event.target.value);
-    localStorage.setItem("selectedVoice", event.target.value);
+    if (typeof window !== "undefined") {
+      localStorage.setItem("selectedVoice", event.target.value);
+    }
   };
 
   const handlePitchChange = (event, newValue) => {
     setPitch(newValue);
-    localStorage.setItem("pitch", newValue);
+    if (typeof window !== "undefined") {
+      localStorage.setItem("pitch", newValue);
+    }
   };
 
   const handleRateChange = (event, newValue) => {
     setRate(newValue);
-    localStorage.setItem("rate", newValue);
+    if (typeof window !== "undefined") {
+      localStorage.setItem("rate", newValue);
+    }
   };
 
   const handleStartDelayChange = (event, newValue) => {
     setStartDelay(newValue);
-    localStorage.setItem("startDelay", newValue);
+    if (typeof window !== "undefined") {
+      localStorage.setItem("startDelay", newValue);
+    }
   };
 
   const requestWakeLock = async () => {
@@ -335,44 +348,46 @@ export default function Home() {
   };
 
   // Function to speak text using the Speech Synthesis API
-// Function to speak text using the Speech Synthesis API
-const speakText = (text, callback) => {
-  if ("speechSynthesis" in window) {
-    window.speechSynthesis.cancel(); // Cancel any ongoing speech
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = "en-GB"; // Set language to UK English
-    utterance.pitch = pitch; // Set pitch
-    utterance.rate = rate; // Set rate
+  // Function to speak text using the Speech Synthesis API
+  const speakText = (text, callback) => {
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.cancel(); // Cancel any ongoing speech
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = "en-GB"; // Set language to UK English
+      utterance.pitch = pitch; // Set pitch
+      utterance.rate = rate; // Set rate
 
-    const setVoice = () => {
-      const voices = window.speechSynthesis.getVoices();
-      let selectedVoiceObj = voices.find((voice) => voice.name === selectedVoice);
+      const setVoice = () => {
+        const voices = window.speechSynthesis.getVoices();
+        let selectedVoiceObj = voices.find(
+          (voice) => voice.name === selectedVoice
+        );
 
-      // Set the selected voice if available
-      if (selectedVoiceObj) {
-        utterance.voice = selectedVoiceObj;
-      }
+        // Set the selected voice if available
+        if (selectedVoiceObj) {
+          utterance.voice = selectedVoiceObj;
+        }
 
-      // Handle end event to call callback
-      utterance.onend = () => {
-        if (callback) callback();
+        // Handle end event to call callback
+        utterance.onend = () => {
+          if (callback) callback();
+        };
+
+        // Speak the text with the selected settings
+        window.speechSynthesis.speak(utterance);
       };
 
-      // Speak the text with the selected settings
-      window.speechSynthesis.speak(utterance);
-    };
-
-    // Load voices if not already loaded
-    if (window.speechSynthesis.getVoices().length > 0) {
-      setVoice();
+      // Load voices if not already loaded
+      if (window.speechSynthesis.getVoices().length > 0) {
+        setVoice();
+      } else {
+        window.speechSynthesis.onvoiceschanged = setVoice;
+      }
     } else {
-      window.speechSynthesis.onvoiceschanged = setVoice;
+      console.warn("Speech Synthesis API not supported in this browser.");
+      if (callback) callback();
     }
-  } else {
-    console.warn("Speech Synthesis API not supported in this browser.");
-    if (callback) callback();
-  }
-};
+  };
 
   const startSpeechRecognition = () => {
     if ("webkitSpeechRecognition" in window || "SpeechRecognition" in window) {
@@ -549,7 +564,8 @@ const speakText = (text, callback) => {
                 },
                 "& .MuiOutlinedInput-root": {
                   "& fieldset": {
-                    borderColor: theme.palette.mode === "dark" ? "#fff" : "#000",
+                    borderColor:
+                      theme.palette.mode === "dark" ? "#fff" : "#000",
                   },
                 },
               }}
