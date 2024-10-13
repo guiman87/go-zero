@@ -6,6 +6,13 @@ import {
   Typography,
   Box,
   CircularProgress,
+  Slider,
+  TextField,
+  MenuItem,
+  Select,
+  FormControl,
+  InputLabel,
+  useTheme
 } from "@mui/material";
 
 export default function Home() {
@@ -14,10 +21,55 @@ export default function Home() {
   const [transcript, setTranscript] = useState("");
   const [status, setStatus] = useState('Click "Start Listening" to begin.');
   const [loading, setLoading] = useState(false);
+  const [sensitivity, setSensitivity] = useState(
+    parseFloat(localStorage.getItem("sensitivity")) || 0.5
+  );
+  const [selectedVoice, setSelectedVoice] = useState(
+    localStorage.getItem("selectedVoice") || ""
+  );
+  const [voices, setVoices] = useState([]);
+  const [pitch, setPitch] = useState(
+    parseFloat(localStorage.getItem("pitch")) || 1
+  );
+  const [rate, setRate] = useState(
+    parseFloat(localStorage.getItem("rate")) || 1
+  );
+  const [startDelay, setStartDelay] = useState(
+    parseFloat(localStorage.getItem("startDelay")) || 0
+  );
+
   const wordBufferRef = useRef([]);
   const wakeLockRef = useRef(null);
+  const theme = useTheme();
 
   useEffect(() => {
+    const loadVoices = () => {
+      const voicesList = window.speechSynthesis.getVoices();
+      setVoices(voicesList);
+
+      // Set the default voice to "Google UK English Male" if available
+      const defaultVoice = voicesList.find(
+        (voice) => voice.name === "Google UK English Male"
+      );
+
+      if (defaultVoice) {
+        setSelectedVoice(defaultVoice.name);
+        localStorage.setItem("selectedVoice", defaultVoice.name);
+      } else if (voicesList.length > 0) {
+        // Otherwise, set to the first available voice
+        setSelectedVoice(voicesList[0].name);
+        localStorage.setItem("selectedVoice", voicesList[0].name);
+      }
+    };
+
+    // Load voices
+    if (window.speechSynthesis) {
+      loadVoices();
+
+      // Ensure voices are loaded if the browser is slow to initialize them
+      window.speechSynthesis.onvoiceschanged = loadVoices;
+    }
+
     let recognizerInstance;
     const loadModel = async () => {
       if (typeof window !== "undefined") {
@@ -68,6 +120,31 @@ export default function Home() {
       }
     };
   }, []);
+
+  const handleSensitivityChange = (event, newValue) => {
+    setSensitivity(newValue);
+    localStorage.setItem("sensitivity", newValue);
+  };
+
+  const handleVoiceChange = (event) => {
+    setSelectedVoice(event.target.value);
+    localStorage.setItem("selectedVoice", event.target.value);
+  };
+
+  const handlePitchChange = (event, newValue) => {
+    setPitch(newValue);
+    localStorage.setItem("pitch", newValue);
+  };
+
+  const handleRateChange = (event, newValue) => {
+    setRate(newValue);
+    localStorage.setItem("rate", newValue);
+  };
+
+  const handleStartDelayChange = (event, newValue) => {
+    setStartDelay(newValue);
+    localStorage.setItem("startDelay", newValue);
+  };
 
   const requestWakeLock = async () => {
     if ("wakeLock" in navigator) {
@@ -161,63 +238,6 @@ export default function Home() {
     }
   };
 
-  // Function to speak text using the Speech Synthesis API
-  const speakText = (text, callback) => {
-    if ("speechSynthesis" in window) {
-      window.speechSynthesis.cancel(); // Cancel any ongoing speech
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = "en-US";
-
-      const setVoice = () => {
-        const voices = window.speechSynthesis.getVoices();
-        let selectedVoice = null;
-
-        // Prioritize male voices in 'en-US' language
-        selectedVoice = voices.find(
-          (voice) =>
-            voice.lang === "en-US" && voice.name.toLowerCase().includes("male")
-        );
-
-        // If no male voice labeled, select any male voice
-        if (!selectedVoice) {
-          selectedVoice = voices.find((voice) =>
-            voice.name.toLowerCase().includes("male")
-          );
-        }
-
-        // If still not found, select any 'en-US' voice
-        if (!selectedVoice) {
-          selectedVoice = voices.find((voice) => voice.lang === "en-US");
-        }
-
-        // Set the selected voice if available
-        if (selectedVoice) {
-          utterance.voice = selectedVoice;
-        }
-
-        // Handle end event to call callback
-        utterance.onend = () => {
-          if (callback) callback();
-        };
-
-        window.speechSynthesis.speak(utterance);
-      };
-
-      // Load voices if not already loaded
-      if (window.speechSynthesis.getVoices().length > 0) {
-        setVoice();
-      } else {
-        window.speechSynthesis.onvoiceschanged = () => {
-          setVoice();
-        };
-      }
-    } else {
-      console.warn("Speech Synthesis API not supported in this browser.");
-      if (callback) callback();
-    }
-  };
-
-  // Function to play a beep tone (used for start sound)
   const playBeep = (
     frequency = 440,
     duration = 500,
@@ -289,7 +309,7 @@ export default function Home() {
             }
           },
           {
-            probabilityThreshold: 0.5,
+            probabilityThreshold: sensitivity,
             overlapFactor: 0.75,
             includeSpectrogram: false,
             invokeCallbackOnNoiseAndUnknown: false,
@@ -313,6 +333,46 @@ export default function Home() {
       releaseWakeLock();
     }
   };
+
+  // Function to speak text using the Speech Synthesis API
+// Function to speak text using the Speech Synthesis API
+const speakText = (text, callback) => {
+  if ("speechSynthesis" in window) {
+    window.speechSynthesis.cancel(); // Cancel any ongoing speech
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "en-GB"; // Set language to UK English
+    utterance.pitch = pitch; // Set pitch
+    utterance.rate = rate; // Set rate
+
+    const setVoice = () => {
+      const voices = window.speechSynthesis.getVoices();
+      let selectedVoiceObj = voices.find((voice) => voice.name === selectedVoice);
+
+      // Set the selected voice if available
+      if (selectedVoiceObj) {
+        utterance.voice = selectedVoiceObj;
+      }
+
+      // Handle end event to call callback
+      utterance.onend = () => {
+        if (callback) callback();
+      };
+
+      // Speak the text with the selected settings
+      window.speechSynthesis.speak(utterance);
+    };
+
+    // Load voices if not already loaded
+    if (window.speechSynthesis.getVoices().length > 0) {
+      setVoice();
+    } else {
+      window.speechSynthesis.onvoiceschanged = setVoice;
+    }
+  } else {
+    console.warn("Speech Synthesis API not supported in this browser.");
+    if (callback) callback();
+  }
+};
 
   const startSpeechRecognition = () => {
     if ("webkitSpeechRecognition" in window || "SpeechRecognition" in window) {
@@ -462,6 +522,87 @@ export default function Home() {
             >
               {listening ? "Stop Listening" : "Start Listening"}
             </Button>
+          </Box>
+          <Box sx={{ my: 3 }}>
+            <Typography gutterBottom>
+              Wake Word Sensitivity: {sensitivity.toFixed(2)}
+            </Typography>
+            <Slider
+              value={sensitivity}
+              onChange={handleSensitivityChange}
+              min={0.1}
+              max={1.0}
+              step={0.01}
+              aria-labelledby="sensitivity-slider"
+            />
+          </Box>
+          <Box sx={{ my: 3 }}>
+            <FormControl
+              fullWidth
+              variant="outlined"
+              sx={{
+                "& .MuiInputLabel-root": {
+                  color: theme.palette.mode === "dark" ? "#fff" : "#000",
+                },
+                "& .MuiSelect-outlined": {
+                  color: theme.palette.mode === "dark" ? "#fff" : "#000",
+                },
+                "& .MuiOutlinedInput-root": {
+                  "& fieldset": {
+                    borderColor: theme.palette.mode === "dark" ? "#fff" : "#000",
+                  },
+                },
+              }}
+            >
+              <InputLabel id="voice-select-label">Voice Selection</InputLabel>
+              <Select
+                labelId="voice-select-label"
+                value={selectedVoice}
+                onChange={handleVoiceChange}
+                label="Voice Selection"
+              >
+                {voices.map((voice, index) => (
+                  <MenuItem key={index} value={voice.name}>
+                    {voice.name} ({voice.lang})
+                  </MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+          </Box>
+          <Box sx={{ my: 3 }}>
+            <Typography gutterBottom>Pitch: {pitch}</Typography>
+            <Slider
+              value={pitch}
+              onChange={handlePitchChange}
+              min={0.5}
+              max={2.0}
+              step={0.1}
+              aria-labelledby="pitch-slider"
+            />
+          </Box>
+          <Box sx={{ my: 3 }}>
+            <Typography gutterBottom>Rate: {rate}</Typography>
+            <Slider
+              value={rate}
+              onChange={handleRateChange}
+              min={0.5}
+              max={2.0}
+              step={0.1}
+              aria-labelledby="rate-slider"
+            />
+          </Box>
+          <Box sx={{ my: 3 }}>
+            <Typography gutterBottom>
+              Start Delay (seconds): {startDelay}
+            </Typography>
+            <Slider
+              value={startDelay}
+              onChange={handleStartDelayChange}
+              min={0}
+              max={5}
+              step={0.5}
+              aria-labelledby="delay-slider"
+            />
           </Box>
           {transcript && (
             <Box
