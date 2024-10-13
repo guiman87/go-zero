@@ -15,51 +15,84 @@ export default function Home() {
   const [status, setStatus] = useState('Click "Start Listening" to begin.');
   const [loading, setLoading] = useState(false);
   const wordBufferRef = useRef([]);
+  const wakeLockRef = useRef(null);
 
   useEffect(() => {
     let recognizerInstance;
     const loadModel = async () => {
-      if (typeof window !== 'undefined') {
+      if (typeof window !== "undefined") {
         setLoading(true);
-  
+
         // Load TensorFlow.js and the speech commands model
-        const tf = await import('@tensorflow/tfjs');
-        const speechCommands = await import('@tensorflow-models/speech-commands');
-  
+        const tf = await import("@tensorflow/tfjs");
+        const speechCommands = await import(
+          "@tensorflow-models/speech-commands"
+        );
+
         // Set the backend
         try {
-          await tf.setBackend('webgl');
+          await tf.setBackend("webgl");
           await tf.ready();
-          console.log('Using WebGL backend');
+          console.log("Using WebGL backend");
         } catch (error) {
-          console.warn('WebGL backend not supported, falling back to CPU.');
-          await tf.setBackend('cpu');
+          console.warn("WebGL backend not supported, falling back to CPU.");
+          await tf.setBackend("cpu");
           await tf.ready();
         }
-  
-        recognizerInstance = speechCommands.create('BROWSER_FFT');
+
+        recognizerInstance = speechCommands.create("BROWSER_FFT");
         await recognizerInstance.ensureModelLoaded();
         setRecognizer(recognizerInstance);
         setLoading(false);
-  
+
         // Start listening automatically after the model is loaded
         startListening();
       }
     };
-  
+
     loadModel();
-  
+
     // Cleanup function
     return () => {
       // Stop the recognizer if it's listening
       if (recognizerInstance && recognizerInstance.isListening()) {
-        recognizerInstance.stopListening().catch(error => {
-          console.error('Error stopping recognizer on unmount:', error);
+        recognizerInstance.stopListening().catch((error) => {
+          console.error("Error stopping recognizer on unmount:", error);
+        });
+      }
+      // Release the wake lock if active
+      if (wakeLockRef.current) {
+        wakeLockRef.current.release().catch((error) => {
+          console.error("Error releasing wake lock on unmount:", error);
         });
       }
     };
   }, []);
-  
+
+  const requestWakeLock = async () => {
+    if ("wakeLock" in navigator) {
+      try {
+        wakeLockRef.current = await navigator.wakeLock.request("screen");
+        console.log("Wake lock is active");
+      } catch (error) {
+        console.error("Error requesting wake lock:", error);
+      }
+    } else {
+      console.warn("Wake Lock API not supported in this browser.");
+    }
+  };
+
+  const releaseWakeLock = async () => {
+    if (wakeLockRef.current) {
+      try {
+        await wakeLockRef.current.release();
+        console.log("Wake lock released");
+        wakeLockRef.current = null;
+      } catch (error) {
+        console.error("Error releasing wake lock:", error);
+      }
+    }
+  };
 
   // Success beep function (friendly melody)
   const playSuccessBeep = () => {
@@ -222,6 +255,9 @@ export default function Home() {
       // Play the start sound (e.g., high-pitched beep)
       playBeep(660, 200); // Frequency: 660Hz, Duration: 200ms
 
+      // Request the wake lock to keep the screen on
+      requestWakeLock();
+
       recognizer
         .listen(
           async (result) => {
@@ -273,6 +309,8 @@ export default function Home() {
       setListening(false);
       setStatus("Stopped listening.");
       wordBufferRef.current = []; // Reset the buffer
+      // Release the wake lock
+      releaseWakeLock();
     }
   };
 
