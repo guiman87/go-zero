@@ -142,21 +142,35 @@ class TFLiteClassifier(val context: Context, val listener: WakeWordListener) {
     }
 
     // Consecutive trigger counters
+    // GO needs 3 frames (~600ms) — false GO triggers are expensive (starts a listening window)
+    // ZERO needs 2 frames (~400ms) — it's a shorter word, harder to sustain 3 consecutive frames
     private var consecutiveGoCount = 0
     private var consecutiveZeroCount = 0
-    private val TRIGGER_FRAMES = 2 // Require 2 consecutive frames ~400ms
+    private val GO_TRIGGER_FRAMES = 3
+    private val ZERO_TRIGGER_FRAMES = 2
 
-    // Smoothing state — 5-frame rolling average (~1000ms window) for both words
+    // GO smoothing: 5-frame window (~1000ms) — longer window reduces false GO triggers
     private val scoreHistory = FloatArray(5) { 0f }
     private var historyIndex = 0
-    private val zeroScoreHistory = FloatArray(5) { 0f }
+    // ZERO smoothing: 3-frame window (~600ms) — shorter because "zero" is a brief word;
+    // 5-frame window caused ~600ms startup delay before the average crossed threshold
+    private val zeroScoreHistory = FloatArray(3) { 0f }
     private var zeroHistoryIndex = 0
 
     // Pre-allocated output buffer (set in start(), reused every inference)
     private var outputBuffer: java.nio.FloatBuffer? = null
 
-    // Energy gate: skip inference on frames below this RMS (~-40 dBFS)
-    private val SILENCE_THRESHOLD = 0.01f
+    // Adaptive noise floor: tracks the ambient RMS level (TV, kitchen noise) using a
+    // slow exponential moving average. Only frames significantly louder than this
+    // baseline are considered speech and sent through inference.
+    private var ambientRms = 0.02f
+    private val AMBIENT_ALPHA = 0.002f     // ~500-frame time constant (~100s) — very slow adaptation
+    private val SPEECH_GAIN = 1.7f         // Speech must be 1.7x louder than ambient — catches quieter word tails
+    private val AMBIENT_UPDATE_GAIN = 1.3f // Update ambient when frame is within 30% of current ambient
+
+    // Score dominance margin: the detected word must beat "unknown" by this margin,
+    // not just cross the threshold. Prevents TV speech from triggering at low confidence.
+    private val SCORE_MARGIN = 0.15f
 
     private fun classifyAudio() {
         if (!isListening || interpreter == null || audioRecord == null) return
@@ -165,14 +179,27 @@ class TFLiteClassifier(val context: Context, val listener: WakeWordListener) {
             // Load Audio
             tensorAudio?.load(audioRecord)
 
-            // Energy gate: skip inference on silent frames to avoid polluting score history
+            // Adaptive noise floor gate.
+            // Compute RMS of current frame, then slowly update the ambient baseline.
+            // Frames at or near ambient level (TV/kitchen noise) are skipped so they
+            // don't pollute the score history. Only frames significantly louder than
+            // ambient (i.e. someone speaking nearby) proceed to inference.
             val audioFloats = tensorAudio!!.tensorBuffer.floatArray
             val rms = Math.sqrt(audioFloats.map { it * it }.average()).toFloat()
-            if (rms < SILENCE_THRESHOLD) {
+
+            // Update ambient baseline only on quiet-ish frames (not during speech)
+            if (rms < ambientRms * AMBIENT_UPDATE_GAIN) {
+                ambientRms = ambientRms * (1f - AMBIENT_ALPHA) + rms * AMBIENT_ALPHA
+            }
+
+            if (rms < ambientRms * SPEECH_GAIN) {
+                // Frame is ambient noise — reset consecutive counters and skip inference
                 consecutiveGoCount = 0
                 consecutiveZeroCount = 0
                 return
             }
+
+            Log.v("TFLite", "Speech frame: rms=%.4f ambient=%.4f ratio=%.1fx".format(rms, ambientRms, rms / ambientRms))
 
             // Run inference using pre-allocated output buffer
             val buf = outputBuffer ?: return
@@ -183,10 +210,10 @@ class TFLiteClassifier(val context: Context, val listener: WakeWordListener) {
             val results = FloatArray(buf.capacity())
             buf.rewind()
             buf.get(results)
-            
+
             // Apply Softmax to convert logits to probabilities
             val probs = softmax(results)
-            
+
             // Helper to get score for a specific label
             fun getScore(label: String): Float {
                 val idx = labels.indexOf(label)
@@ -196,22 +223,25 @@ class TFLiteClassifier(val context: Context, val listener: WakeWordListener) {
             val goScore = getScore("go")
             val zeroScore = getScore("zero")
             val unknownScore = getScore("unknown")
-            
+
+            Log.v("TFLite", "Scores — go=%.2f zero=%.2f unknown=%.2f | goConsec=%d zeroConsec=%d goArmed=%s"
+                .format(goScore, zeroScore, unknownScore, consecutiveGoCount, consecutiveZeroCount, if (lastGoTime > 0) "yes" else "no"))
+
             // Smoothing for "Go"
             scoreHistory[historyIndex] = goScore
             historyIndex = (historyIndex + 1) % scoreHistory.size
             val smoothedGoScore = scoreHistory.average().toFloat()
 
-            // Logic: Go
-            if (smoothedGoScore > sensitivityThreshold && smoothedGoScore > unknownScore) {
+            // Logic: Go — must clear threshold AND beat unknown by SCORE_MARGIN
+            if (smoothedGoScore > sensitivityThreshold && smoothedGoScore > unknownScore + SCORE_MARGIN) {
                  consecutiveGoCount++
             } else {
                  consecutiveGoCount = 0
             }
 
-            if (consecutiveGoCount >= TRIGGER_FRAMES) {
+            if (consecutiveGoCount >= GO_TRIGGER_FRAMES) {
                  if (lastGoTime == 0L || (System.currentTimeMillis() - lastGoTime > sequenceTimeoutMs)) {
-                      Log.d("TFLite", "Confirmed/Sustained GO detected")
+                      Log.d("TFLite", "Confirmed/Sustained GO detected (smoothed=%.2f)".format(smoothedGoScore))
                       lastGoTime = System.currentTimeMillis()
                  }
             }
@@ -221,17 +251,18 @@ class TFLiteClassifier(val context: Context, val listener: WakeWordListener) {
             zeroHistoryIndex = (zeroHistoryIndex + 1) % zeroScoreHistory.size
             val smoothedZeroScore = zeroScoreHistory.average().toFloat()
 
-            if (smoothedZeroScore > sensitivityThreshold && smoothedZeroScore > goScore && smoothedZeroScore > unknownScore) {
+            // Must clear threshold AND beat unknown by SCORE_MARGIN
+            if (smoothedZeroScore > sensitivityThreshold && smoothedZeroScore > unknownScore + SCORE_MARGIN && smoothedZeroScore > goScore) {
                 consecutiveZeroCount++
             } else {
                 consecutiveZeroCount = 0
             }
 
-            if (consecutiveZeroCount >= TRIGGER_FRAMES) {
+            if (consecutiveZeroCount >= ZERO_TRIGGER_FRAMES) {
                 val now = System.currentTimeMillis()
                 // Must be AFTER "Go" (at least 200ms) but WITHIN timeout.
                 if (lastGoTime > 0 && (now - lastGoTime < sequenceTimeoutMs) && (now - lastGoTime > 200)) {
-                     Log.i("TFLite", "Wake Word 'Go Zero' COMPLETION!")
+                     Log.i("TFLite", "Wake Word 'Go Zero' COMPLETION! (zero smoothed=%.2f, gap=%dms)".format(smoothedZeroScore, now - lastGoTime))
                      listener.onWakeWordDetected()
                      lastGoTime = 0
                      consecutiveZeroCount = 0
