@@ -149,8 +149,9 @@ class TFLiteClassifier(val context: Context, val listener: WakeWordListener) {
     private val GO_TRIGGER_FRAMES = 3
     private val ZERO_TRIGGER_FRAMES = 2
 
-    // GO smoothing: 5-frame window (~1000ms) — longer window reduces false GO triggers
-    private val scoreHistory = FloatArray(5) { 0f }
+    // GO smoothing: 3-frame window (~600ms) — 5-frame window caused too much ramp-up delay;
+    // early zero-frames diluted even go=0.99 scores below threshold until the 4th frame
+    private val scoreHistory = FloatArray(3) { 0f }
     private var historyIndex = 0
     // ZERO smoothing: 3-frame window (~600ms) — shorter because "zero" is a brief word;
     // 5-frame window caused ~600ms startup delay before the average crossed threshold
@@ -168,9 +169,10 @@ class TFLiteClassifier(val context: Context, val listener: WakeWordListener) {
     private val SPEECH_GAIN = 1.7f         // Speech must be 1.7x louder than ambient — catches quieter word tails
     private val AMBIENT_UPDATE_GAIN = 1.3f // Update ambient when frame is within 30% of current ambient
 
-    // Score dominance margin: the detected word must beat "unknown" by this margin,
-    // not just cross the threshold. Prevents TV speech from triggering at low confidence.
-    private val SCORE_MARGIN = 0.15f
+    // Score dominance margin: the detected word must beat "unknown" by this margin.
+    // Adaptive floor is the primary noise defence; margin is secondary — 0.10 avoids
+    // rejecting valid detections when the model has a brief uncertain frame mid-word.
+    private val SCORE_MARGIN = 0.10f
 
     private fun classifyAudio() {
         if (!isListening || interpreter == null || audioRecord == null) return
