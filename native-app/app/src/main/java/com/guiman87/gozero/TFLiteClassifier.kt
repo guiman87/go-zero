@@ -106,13 +106,25 @@ class TFLiteClassifier(val context: Context, val listener: WakeWordListener) {
                      Log.w("TFLite", "AcousticEchoCanceler NOT available")
                 }
 
+                if (android.media.audiofx.AutomaticGainControl.isAvailable()) {
+                     val agc = android.media.audiofx.AutomaticGainControl.create(audioRecord!!.audioSessionId)
+                     agc.enabled = true
+                     Log.i("TFLite", "AutomaticGainControl enabled")
+                } else {
+                     Log.w("TFLite", "AutomaticGainControl NOT available")
+                }
+
             } catch (e: SecurityException) {
                 Log.e("TFLite", "Permission denied", e)
                 return
             }
             
             audioRecord?.startRecording()
-            
+
+            // Pre-allocate output buffer once to avoid per-inference GC churn
+            val outputShape = interpreter!!.getOutputTensor(0).shape()
+            outputBuffer = java.nio.FloatBuffer.allocate(outputShape[1])
+
             // 3. Inference Loop
             executor = ScheduledThreadPoolExecutor(1)
             isListening = true
@@ -129,14 +141,22 @@ class TFLiteClassifier(val context: Context, val listener: WakeWordListener) {
         }
     }
 
-    // Consective trigger counters
+    // Consecutive trigger counters
     private var consecutiveGoCount = 0
     private var consecutiveZeroCount = 0
     private val TRIGGER_FRAMES = 2 // Require 2 consecutive frames ~400ms
 
-    // Smoothing state
-    private val scoreHistory = FloatArray(3) { 0f } // Track last 3 "Go" scores
+    // Smoothing state — 5-frame rolling average (~1000ms window) for both words
+    private val scoreHistory = FloatArray(5) { 0f }
     private var historyIndex = 0
+    private val zeroScoreHistory = FloatArray(5) { 0f }
+    private var zeroHistoryIndex = 0
+
+    // Pre-allocated output buffer (set in start(), reused every inference)
+    private var outputBuffer: java.nio.FloatBuffer? = null
+
+    // Energy gate: skip inference on frames below this RMS (~-40 dBFS)
+    private val SILENCE_THRESHOLD = 0.01f
 
     private fun classifyAudio() {
         if (!isListening || interpreter == null || audioRecord == null) return
@@ -144,19 +164,25 @@ class TFLiteClassifier(val context: Context, val listener: WakeWordListener) {
         try {
             // Load Audio
             tensorAudio?.load(audioRecord)
-            
-            // Prepare Output Buffer
-            val outputTensor = interpreter!!.getOutputTensor(0)
-            val outputShape = outputTensor.shape() 
-            val outputBuffer = java.nio.FloatBuffer.allocate(outputShape[1])
-            
-            // Run
-            interpreter!!.run(tensorAudio!!.tensorBuffer.buffer, outputBuffer)
-            
+
+            // Energy gate: skip inference on silent frames to avoid polluting score history
+            val audioFloats = tensorAudio!!.tensorBuffer.floatArray
+            val rms = Math.sqrt(audioFloats.map { it * it }.average()).toFloat()
+            if (rms < SILENCE_THRESHOLD) {
+                consecutiveGoCount = 0
+                consecutiveZeroCount = 0
+                return
+            }
+
+            // Run inference using pre-allocated output buffer
+            val buf = outputBuffer ?: return
+            buf.rewind()
+            interpreter!!.run(tensorAudio!!.tensorBuffer.buffer, buf)
+
             // Process Results
-            val results = FloatArray(outputShape[1])
-            outputBuffer.rewind()
-            outputBuffer.get(results)
+            val results = FloatArray(buf.capacity())
+            buf.rewind()
+            buf.get(results)
             
             // Apply Softmax to convert logits to probabilities
             val probs = softmax(results)
@@ -177,10 +203,6 @@ class TFLiteClassifier(val context: Context, val listener: WakeWordListener) {
             val smoothedGoScore = scoreHistory.average().toFloat()
 
             // Logic: Go
-            // Use SMOOTHED score for "Go" trigger, but check raw suppression too?
-            // Actually, smoothing + consecutive check might be overkill, but safer.
-            // Let's rely on Consecutive Check as the primary filter for spikes.
-            
             if (smoothedGoScore > sensitivityThreshold && smoothedGoScore > unknownScore) {
                  consecutiveGoCount++
             } else {
@@ -188,16 +210,18 @@ class TFLiteClassifier(val context: Context, val listener: WakeWordListener) {
             }
 
             if (consecutiveGoCount >= TRIGGER_FRAMES) {
-                 if (lastGoTime == 0L || (System.currentTimeMillis() - lastGoTime > 2000)) {
+                 if (lastGoTime == 0L || (System.currentTimeMillis() - lastGoTime > sequenceTimeoutMs)) {
                       Log.d("TFLite", "Confirmed/Sustained GO detected")
                       lastGoTime = System.currentTimeMillis()
-                      // Reset counter to prevent spamming log, but keep it high? 
-                      // No, we set lastGoTime, so we won't process Zero until later.
                  }
             }
-            
-            // Logic: Zero
-            if (zeroScore > sensitivityThreshold && zeroScore > goScore && zeroScore > unknownScore) {
+
+            // Logic: Zero — use smoothed score (same approach as GO)
+            zeroScoreHistory[zeroHistoryIndex] = zeroScore
+            zeroHistoryIndex = (zeroHistoryIndex + 1) % zeroScoreHistory.size
+            val smoothedZeroScore = zeroScoreHistory.average().toFloat()
+
+            if (smoothedZeroScore > sensitivityThreshold && smoothedZeroScore > goScore && smoothedZeroScore > unknownScore) {
                 consecutiveZeroCount++
             } else {
                 consecutiveZeroCount = 0
@@ -205,15 +229,15 @@ class TFLiteClassifier(val context: Context, val listener: WakeWordListener) {
 
             if (consecutiveZeroCount >= TRIGGER_FRAMES) {
                 val now = System.currentTimeMillis()
-                // 2. Timing: Must be AFTER "Go" (at least 200ms) but WITHIN timeout.
+                // Must be AFTER "Go" (at least 200ms) but WITHIN timeout.
                 if (lastGoTime > 0 && (now - lastGoTime < sequenceTimeoutMs) && (now - lastGoTime > 200)) {
                      Log.i("TFLite", "Wake Word 'Go Zero' COMPLETION!")
                      listener.onWakeWordDetected()
-                     lastGoTime = 0 // Reset
-                     consecutiveZeroCount = 0 // Reset
-                     consecutiveGoCount = 0 // Reset
-                     // Reset history
-                     for(i in scoreHistory.indices) scoreHistory[i] = 0f
+                     lastGoTime = 0
+                     consecutiveZeroCount = 0
+                     consecutiveGoCount = 0
+                     for (i in scoreHistory.indices) scoreHistory[i] = 0f
+                     for (i in zeroScoreHistory.indices) zeroScoreHistory[i] = 0f
                 }
             }
             
