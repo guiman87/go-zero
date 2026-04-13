@@ -42,7 +42,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@OptIn(ExperimentalPermissionsApi::class)
+@OptIn(ExperimentalPermissionsApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen() {
     val context = LocalContext.current
@@ -58,6 +58,7 @@ fun MainScreen() {
         // DataStore Keys
     val SENSITIVITY = androidx.datastore.preferences.core.floatPreferencesKey("sensitivity")
     val TIMEOUT = androidx.datastore.preferences.core.longPreferencesKey("sequence_timeout")
+    val WAKE_PHRASE = androidx.datastore.preferences.core.stringPreferencesKey("wake_phrase")
 
     // State
     var haUrl by remember { mutableStateOf("") }
@@ -66,6 +67,7 @@ fun MainScreen() {
     var lastResponse by remember { mutableStateOf("") }
     var sensitivity by remember { mutableStateOf(0.7f) }
     var timeout by remember { mutableStateOf(2000L) }
+    var selectedPhrase by remember { mutableStateOf(WakePhrase.GO_ZERO) }
     var isListening by remember { mutableStateOf(false) }
 
     // Load saved preferences
@@ -79,6 +81,7 @@ fun MainScreen() {
             lastResponse = preferences[LAST_RESPONSE] ?: ""
             sensitivity = preferences[SENSITIVITY] ?: 0.7f
             timeout = preferences[TIMEOUT] ?: 2000L
+            selectedPhrase = WakePhrase.fromName(preferences[WAKE_PHRASE] ?: WakePhrase.GO_ZERO.name)
         }
     }
 
@@ -112,7 +115,48 @@ fun MainScreen() {
         )
 
         Spacer(modifier = Modifier.height(16.dp))
-        
+
+        // Wake Phrase Dropdown
+        var phraseMenuExpanded by remember { mutableStateOf(false) }
+        Text(text = "Wake Phrase", style = MaterialTheme.typography.labelMedium)
+        Spacer(modifier = Modifier.height(4.dp))
+        ExposedDropdownMenuBox(
+            expanded = phraseMenuExpanded,
+            onExpandedChange = { phraseMenuExpanded = it }
+        ) {
+            OutlinedTextField(
+                value = selectedPhrase.displayName,
+                onValueChange = {},
+                readOnly = true,
+                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = phraseMenuExpanded) },
+                modifier = Modifier
+                    .menuAnchor()
+                    .fillMaxWidth()
+            )
+            ExposedDropdownMenu(
+                expanded = phraseMenuExpanded,
+                onDismissRequest = { phraseMenuExpanded = false }
+            ) {
+                WakePhrase.entries.forEach { phrase ->
+                    DropdownMenuItem(
+                        text = {
+                            Column {
+                                Text(phrase.displayName, style = MaterialTheme.typography.bodyLarge)
+                                Text(phrase.description, style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        },
+                        onClick = {
+                            selectedPhrase = phrase
+                            phraseMenuExpanded = false
+                        }
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
         // Sensitivity Slider
         // Inverted logic for UI: 
         // Underlying value is "Threshold" (High = Strict/Less Sensitive).
@@ -140,7 +184,7 @@ fun MainScreen() {
             valueRange = 500f..5000f,
             steps = 9
         )
-        Text(text = "Time allowed between 'Go' and 'Zero'", style = MaterialTheme.typography.bodySmall)
+        Text(text = "Time allowed between first and second word", style = MaterialTheme.typography.bodySmall)
         
         Spacer(modifier = Modifier.height(16.dp))
 
@@ -152,6 +196,7 @@ fun MainScreen() {
                         preferences[HA_TOKEN] = haToken
                         preferences[SENSITIVITY] = sensitivity
                         preferences[TIMEOUT] = timeout
+                        preferences[WAKE_PHRASE] = selectedPhrase.name
                     }
                 }
             },

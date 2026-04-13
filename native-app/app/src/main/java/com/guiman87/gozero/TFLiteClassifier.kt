@@ -19,16 +19,14 @@ class TFLiteClassifier(val context: Context, val listener: WakeWordListener) {
     private var audioRecord: AudioRecord? = null
     private var executor: ScheduledThreadPoolExecutor? = null
     private var isListening = false
-    
-    // Labels for custom "Go Zero" model (from train_go_zero.py)
-    private val labels = listOf(
-        "go", "unknown", "zero"
-    )
 
-    // State for sequence detection
-    private var lastGoTime: Long = 0
-    private var sequenceTimeoutMs = 2000L // Default
-    private var sensitivityThreshold = 0.7f // Default
+    // Labels for custom "Go Zero" model (from train_go_zero.py)
+    private val labels = listOf("go", "unknown", "zero")
+
+    // Settings
+    private var sequenceTimeoutMs = 2000L
+    private var sensitivityThreshold = 0.7f
+    @Volatile private var currentPhrase = WakePhrase.GO_ZERO
 
     fun setSensitivity(threshold: Float) {
         sensitivityThreshold = threshold
@@ -40,47 +38,44 @@ class TFLiteClassifier(val context: Context, val listener: WakeWordListener) {
         Log.d("TFLite", "Timeout updated to: $timeout")
     }
 
+    fun setWakePhrase(phrase: WakePhrase) {
+        if (phrase != currentPhrase) {
+            currentPhrase = phrase
+            resetState()
+            Log.d("TFLite", "Wake phrase updated to: ${phrase.displayName}")
+        }
+    }
+
     fun start() {
         if (isListening) return
-        
+
         try {
-            // 1. Load Model
             val mappedByteBuffer = FileUtil.loadMappedFile(context, "model.tflite")
-            val options = Interpreter.Options()
-            interpreter = Interpreter(mappedByteBuffer, options)
-            
-            // 2. Setup Input
-            val inputTensorIndex = 0
-            val inputTensor = interpreter!!.getInputTensor(inputTensorIndex)
-            val inputShape = inputTensor.shape()
+            interpreter = Interpreter(mappedByteBuffer, Interpreter.Options())
+
+            val inputShape = interpreter!!.getInputTensor(0).shape()
             Log.d("TFLite", "Input Tensor Shape: ${inputShape.contentToString()}")
-            
-            // Calculate required sample count
+
             val targetSampleCount = if (inputShape.size > 1) {
                 var count = 1
-                for (i in 1 until inputShape.size) {
-                    count *= inputShape[i]
-                }
+                for (i in 1 until inputShape.size) count *= inputShape[i]
                 count
             } else {
-                inputShape[0] 
+                inputShape[0]
             }
             Log.d("TFLite", "Target Samples: $targetSampleCount")
 
-            // 2b. Setup AudioRecord & TensorAudio
-            // Note: Our custom model logic in python expects 16000 sample rate
             val audioFormat = android.media.AudioFormat.Builder()
                 .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
                 .setSampleRate(16000)
                 .setChannelMask(android.media.AudioFormat.CHANNEL_IN_MONO)
                 .build()
-                
-            val tensorAudioFormat = TensorAudio.TensorAudioFormat.create(audioFormat)
-            tensorAudio = TensorAudio.create(tensorAudioFormat, targetSampleCount)
+
+            tensorAudio = TensorAudio.create(TensorAudio.TensorAudioFormat.create(audioFormat), targetSampleCount)
 
             val minBufferSize = AudioRecord.getMinBufferSize(16000, android.media.AudioFormat.CHANNEL_IN_MONO, android.media.AudioFormat.ENCODING_PCM_16BIT)
-            val bufferSize = Math.max(minBufferSize, targetSampleCount * 2) 
-            
+            val bufferSize = Math.max(minBufferSize, targetSampleCount * 2)
+
             try {
                 audioRecord = AudioRecord(
                     android.media.MediaRecorder.AudioSource.VOICE_RECOGNITION,
@@ -89,212 +84,185 @@ class TFLiteClassifier(val context: Context, val listener: WakeWordListener) {
                     android.media.AudioFormat.ENCODING_PCM_16BIT,
                     bufferSize
                 )
-                
+
                 if (android.media.audiofx.NoiseSuppressor.isAvailable()) {
-                     val ns = android.media.audiofx.NoiseSuppressor.create(audioRecord!!.audioSessionId)
-                     ns.enabled = true
-                     Log.i("TFLite", "NoiseSuppressor enabled")
+                    android.media.audiofx.NoiseSuppressor.create(audioRecord!!.audioSessionId).enabled = true
+                    Log.i("TFLite", "NoiseSuppressor enabled")
                 } else {
-                     Log.w("TFLite", "NoiseSuppressor NOT available")
+                    Log.w("TFLite", "NoiseSuppressor NOT available")
                 }
-                
+
                 if (android.media.audiofx.AcousticEchoCanceler.isAvailable()) {
-                     val aec = android.media.audiofx.AcousticEchoCanceler.create(audioRecord!!.audioSessionId)
-                     aec.enabled = true
-                     Log.i("TFLite", "AcousticEchoCanceler enabled")
+                    android.media.audiofx.AcousticEchoCanceler.create(audioRecord!!.audioSessionId).enabled = true
+                    Log.i("TFLite", "AcousticEchoCanceler enabled")
                 } else {
-                     Log.w("TFLite", "AcousticEchoCanceler NOT available")
+                    Log.w("TFLite", "AcousticEchoCanceler NOT available")
                 }
 
                 if (android.media.audiofx.AutomaticGainControl.isAvailable()) {
-                     val agc = android.media.audiofx.AutomaticGainControl.create(audioRecord!!.audioSessionId)
-                     agc.enabled = true
-                     Log.i("TFLite", "AutomaticGainControl enabled")
+                    android.media.audiofx.AutomaticGainControl.create(audioRecord!!.audioSessionId).enabled = true
+                    Log.i("TFLite", "AutomaticGainControl enabled")
                 } else {
-                     Log.w("TFLite", "AutomaticGainControl NOT available")
+                    Log.w("TFLite", "AutomaticGainControl NOT available")
                 }
-
             } catch (e: SecurityException) {
                 Log.e("TFLite", "Permission denied", e)
                 return
             }
-            
+
             audioRecord?.startRecording()
 
-            // Pre-allocate output buffer once to avoid per-inference GC churn
             val outputShape = interpreter!!.getOutputTensor(0).shape()
             outputBuffer = java.nio.FloatBuffer.allocate(outputShape[1])
 
-            // 3. Inference Loop
             executor = ScheduledThreadPoolExecutor(1)
             isListening = true
-            
-            // Run inference faster (200ms) for smoother averaging
-            executor?.scheduleAtFixedRate({
-                classifyAudio()
-            }, 0, 200, TimeUnit.MILLISECONDS)
-            
-            Log.d("TFLite", "Interpreter started")
+
+            executor?.scheduleAtFixedRate({ classifyAudio() }, 0, 200, TimeUnit.MILLISECONDS)
+            Log.d("TFLite", "Interpreter started (phrase: ${currentPhrase.displayName})")
 
         } catch (e: Exception) {
             Log.e("TFLiteClassifier", "Error initializing", e)
         }
     }
 
-    // Consecutive trigger counters
-    // GO needs 3 frames (~600ms) — false GO triggers are expensive (starts a listening window)
-    // ZERO needs 2 frames (~400ms) — it's a shorter word, harder to sustain 3 consecutive frames
-    private var consecutiveGoCount = 0
-    private var consecutiveZeroCount = 0
-    private val GO_TRIGGER_FRAMES = 3
-    private val ZERO_TRIGGER_FRAMES = 2
+    // --- Generalised two-step state machine ---
+    // First word needs 3 consecutive frames (arming is expensive — false arm wastes a listening slot).
+    // Second word needs 2 consecutive frames (it's already armed, speed matters more).
+    private val FIRST_TRIGGER_FRAMES = 3
+    private val SECOND_TRIGGER_FRAMES = 2
 
-    // GO smoothing: 3-frame window (~600ms) — 5-frame window caused too much ramp-up delay;
-    // early zero-frames diluted even go=0.99 scores below threshold until the 4th frame
-    private val scoreHistory = FloatArray(3) { 0f }
-    private var historyIndex = 0
-    // ZERO smoothing: 3-frame window (~600ms) — shorter because "zero" is a brief word;
-    // 5-frame window caused ~600ms startup delay before the average crossed threshold
-    private val zeroScoreHistory = FloatArray(3) { 0f }
-    private var zeroHistoryIndex = 0
+    private var consecutiveFirstCount = 0
+    private var consecutiveSecondCount = 0
+    private var lastFirstWordTime: Long = 0
 
-    // Pre-allocated output buffer (set in start(), reused every inference)
+    // 3-frame rolling averages for each word (~600ms window)
+    private val firstWordHistory = FloatArray(3) { 0f }
+    private var firstHistoryIndex = 0
+    private val secondWordHistory = FloatArray(3) { 0f }
+    private var secondHistoryIndex = 0
+
+    // Pre-allocated output buffer
     private var outputBuffer: java.nio.FloatBuffer? = null
 
-    // Adaptive noise floor: tracks the ambient RMS level (TV, kitchen noise) using a
-    // slow exponential moving average. Only frames significantly louder than this
-    // baseline are considered speech and sent through inference.
+    // Adaptive noise floor
     private var ambientRms = 0.02f
-    private val AMBIENT_ALPHA = 0.002f     // ~500-frame time constant (~100s) — very slow adaptation
-    private val SPEECH_GAIN = 1.7f         // Speech must be 1.7x louder than ambient — catches quieter word tails
-    private val AMBIENT_UPDATE_GAIN = 1.3f // Update ambient when frame is within 30% of current ambient
+    private val AMBIENT_ALPHA = 0.002f
+    private val SPEECH_GAIN = 1.7f
+    private val AMBIENT_UPDATE_GAIN = 1.3f
 
-    // Score dominance margin: the detected word must beat "unknown" by this margin.
-    // Adaptive floor is the primary noise defence; margin is secondary — 0.10 avoids
-    // rejecting valid detections when the model has a brief uncertain frame mid-word.
+    // Score margin: detected word must beat "unknown" by this amount
     private val SCORE_MARGIN = 0.10f
+
+    private fun resetState() {
+        consecutiveFirstCount = 0
+        consecutiveSecondCount = 0
+        lastFirstWordTime = 0
+        for (i in firstWordHistory.indices) firstWordHistory[i] = 0f
+        for (i in secondWordHistory.indices) secondWordHistory[i] = 0f
+    }
 
     private fun classifyAudio() {
         if (!isListening || interpreter == null || audioRecord == null) return
 
         try {
-            // Load Audio
             tensorAudio?.load(audioRecord)
 
-            // Adaptive noise floor gate.
-            // Compute RMS of current frame, then slowly update the ambient baseline.
-            // Frames at or near ambient level (TV/kitchen noise) are skipped so they
-            // don't pollute the score history. Only frames significantly louder than
-            // ambient (i.e. someone speaking nearby) proceed to inference.
+            // Adaptive noise floor gate
             val audioFloats = tensorAudio!!.tensorBuffer.floatArray
             val rms = Math.sqrt(audioFloats.map { it * it }.average()).toFloat()
 
-            // Update ambient baseline only on quiet-ish frames (not during speech)
             if (rms < ambientRms * AMBIENT_UPDATE_GAIN) {
                 ambientRms = ambientRms * (1f - AMBIENT_ALPHA) + rms * AMBIENT_ALPHA
             }
 
             if (rms < ambientRms * SPEECH_GAIN) {
-                // Frame is ambient noise — reset consecutive counters and skip inference
-                consecutiveGoCount = 0
-                consecutiveZeroCount = 0
+                consecutiveFirstCount = 0
+                consecutiveSecondCount = 0
                 return
             }
 
             Log.v("TFLite", "Speech frame: rms=%.4f ambient=%.4f ratio=%.1fx".format(rms, ambientRms, rms / ambientRms))
 
-            // Run inference using pre-allocated output buffer
+            // Run inference
             val buf = outputBuffer ?: return
             buf.rewind()
             interpreter!!.run(tensorAudio!!.tensorBuffer.buffer, buf)
-
-            // Process Results
             val results = FloatArray(buf.capacity())
             buf.rewind()
             buf.get(results)
 
-            // Apply Softmax to convert logits to probabilities
             val probs = softmax(results)
-
-            // Helper to get score for a specific label
             fun getScore(label: String): Float {
                 val idx = labels.indexOf(label)
                 return if (idx != -1) probs[idx] else 0f
             }
 
-            val goScore = getScore("go")
-            val zeroScore = getScore("zero")
+            val phrase = currentPhrase
+            val firstScore = getScore(phrase.firstWord)
+            val secondScore = getScore(phrase.secondWord)
             val unknownScore = getScore("unknown")
 
-            Log.v("TFLite", "Scores — go=%.2f zero=%.2f unknown=%.2f | goConsec=%d zeroConsec=%d goArmed=%s"
-                .format(goScore, zeroScore, unknownScore, consecutiveGoCount, consecutiveZeroCount, if (lastGoTime > 0) "yes" else "no"))
+            Log.v("TFLite", "Scores — ${phrase.firstWord}=%.2f ${phrase.secondWord}=%.2f unknown=%.2f | firstConsec=%d secondConsec=%d armed=%s"
+                .format(firstScore, secondScore, unknownScore, consecutiveFirstCount, consecutiveSecondCount, if (lastFirstWordTime > 0) "yes" else "no"))
 
-            // Smoothing for "Go"
-            scoreHistory[historyIndex] = goScore
-            historyIndex = (historyIndex + 1) % scoreHistory.size
-            val smoothedGoScore = scoreHistory.average().toFloat()
+            // --- Step 1: detect first word ---
+            firstWordHistory[firstHistoryIndex] = firstScore
+            firstHistoryIndex = (firstHistoryIndex + 1) % firstWordHistory.size
+            val smoothedFirst = firstWordHistory.average().toFloat()
 
-            // Logic: Go — must clear threshold AND beat unknown by SCORE_MARGIN
-            if (smoothedGoScore > sensitivityThreshold && smoothedGoScore > unknownScore + SCORE_MARGIN) {
-                 consecutiveGoCount++
+            if (smoothedFirst > sensitivityThreshold && smoothedFirst > unknownScore + SCORE_MARGIN) {
+                consecutiveFirstCount++
             } else {
-                 consecutiveGoCount = 0
+                consecutiveFirstCount = 0
             }
 
-            if (consecutiveGoCount >= GO_TRIGGER_FRAMES) {
-                 if (lastGoTime == 0L || (System.currentTimeMillis() - lastGoTime > sequenceTimeoutMs)) {
-                      Log.d("TFLite", "Confirmed/Sustained GO detected (smoothed=%.2f)".format(smoothedGoScore))
-                      lastGoTime = System.currentTimeMillis()
-                 }
-            }
-
-            // Logic: Zero — use smoothed score (same approach as GO)
-            zeroScoreHistory[zeroHistoryIndex] = zeroScore
-            zeroHistoryIndex = (zeroHistoryIndex + 1) % zeroScoreHistory.size
-            val smoothedZeroScore = zeroScoreHistory.average().toFloat()
-
-            // Must clear threshold AND beat unknown by SCORE_MARGIN
-            if (smoothedZeroScore > sensitivityThreshold && smoothedZeroScore > unknownScore + SCORE_MARGIN && smoothedZeroScore > goScore) {
-                consecutiveZeroCount++
-            } else {
-                consecutiveZeroCount = 0
-            }
-
-            if (consecutiveZeroCount >= ZERO_TRIGGER_FRAMES) {
-                val now = System.currentTimeMillis()
-                // Must be AFTER "Go" (at least 200ms) but WITHIN timeout.
-                if (lastGoTime > 0 && (now - lastGoTime < sequenceTimeoutMs) && (now - lastGoTime > 200)) {
-                     Log.i("TFLite", "Wake Word 'Go Zero' COMPLETION! (zero smoothed=%.2f, gap=%dms)".format(smoothedZeroScore, now - lastGoTime))
-                     listener.onWakeWordDetected()
-                     lastGoTime = 0
-                     consecutiveZeroCount = 0
-                     consecutiveGoCount = 0
-                     for (i in scoreHistory.indices) scoreHistory[i] = 0f
-                     for (i in zeroScoreHistory.indices) zeroScoreHistory[i] = 0f
+            if (consecutiveFirstCount >= FIRST_TRIGGER_FRAMES) {
+                if (lastFirstWordTime == 0L || (System.currentTimeMillis() - lastFirstWordTime > sequenceTimeoutMs)) {
+                    Log.d("TFLite", "First word '${phrase.firstWord}' confirmed (smoothed=%.2f)".format(smoothedFirst))
+                    lastFirstWordTime = System.currentTimeMillis()
+                    // Reset second word history so same-word phrases (Zero Zero) don't
+                    // immediately fire from leftover score momentum
+                    for (i in secondWordHistory.indices) secondWordHistory[i] = 0f
+                    consecutiveSecondCount = 0
                 }
             }
-            
+
+            // --- Step 2: detect second word (only when armed) ---
+            secondWordHistory[secondHistoryIndex] = secondScore
+            secondHistoryIndex = (secondHistoryIndex + 1) % secondWordHistory.size
+            val smoothedSecond = secondWordHistory.average().toFloat()
+
+            if (smoothedSecond > sensitivityThreshold && smoothedSecond > unknownScore + SCORE_MARGIN) {
+                consecutiveSecondCount++
+            } else {
+                consecutiveSecondCount = 0
+            }
+
+            if (consecutiveSecondCount >= SECOND_TRIGGER_FRAMES) {
+                val now = System.currentTimeMillis()
+                if (lastFirstWordTime > 0 && (now - lastFirstWordTime < sequenceTimeoutMs) && (now - lastFirstWordTime > 200)) {
+                    Log.i("TFLite", "'${phrase.displayName}' COMPLETION! (second smoothed=%.2f, gap=%dms)".format(smoothedSecond, now - lastFirstWordTime))
+                    listener.onWakeWordDetected()
+                    resetState()
+                }
+            }
+
         } catch (e: Exception) {
             Log.e("TFLite", "Inference loop error", e)
         }
     }
-    
+
     private fun softmax(logits: FloatArray): FloatArray {
         val probs = FloatArray(logits.size)
         var maxLogit = -Float.MAX_VALUE
-        for (logit in logits) {
-            if (logit > maxLogit) maxLogit = logit
-        }
-        
+        for (logit in logits) if (logit > maxLogit) maxLogit = logit
         var sum = 0.0f
         for (i in logits.indices) {
             probs[i] = Math.exp((logits[i] - maxLogit).toDouble()).toFloat()
             sum += probs[i]
         }
-        
-        for (i in probs.indices) {
-            probs[i] /= sum
-        }
+        for (i in probs.indices) probs[i] /= sum
         return probs
     }
 

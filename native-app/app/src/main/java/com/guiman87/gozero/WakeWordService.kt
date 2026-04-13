@@ -70,14 +70,17 @@ class WakeWordService : Service(), WakeWordListener {
         serviceScope.launch {
             val SENSITIVITY = androidx.datastore.preferences.core.floatPreferencesKey("sensitivity")
             val TIMEOUT = androidx.datastore.preferences.core.longPreferencesKey("sequence_timeout")
+            val WAKE_PHRASE = androidx.datastore.preferences.core.stringPreferencesKey("wake_phrase")
             val context = this@WakeWordService
 
             context.dataStore.data.collect { prefs ->
                 val sensitivity = prefs[SENSITIVITY] ?: 0.7f
                 val timeout = prefs[TIMEOUT] ?: 2000L
-                
+                val phraseStr = prefs[WAKE_PHRASE] ?: WakePhrase.GO_ZERO.name
+
                 classifier?.setSensitivity(sensitivity)
                 classifier?.setTimeout(timeout)
+                classifier?.setWakePhrase(WakePhrase.fromName(phraseStr))
             }
         }
     }
